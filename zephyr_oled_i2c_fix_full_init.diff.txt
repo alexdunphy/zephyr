@@ -1,0 +1,281 @@
+diff --git a/drivers/display/ssd1306.c b/drivers/display/ssd1306.c
+index 08b447e3b..d1922d7b5 100644
+--- a/drivers/display/ssd1306.c
++++ b/drivers/display/ssd1306.c
+@@ -440,9 +440,87 @@ static int ssd1306_init(const struct device *dev)
+ 	return 0;
+ }
+ 
++static int ssd1306_re_init(const struct device *dev)
++{
++	LOG_DBG("ssd1306 oled re-init now");
++
++	// Note: uncoment below for full re-init
++	return ssd1306_init(dev);
++
++	// Note: Below list is minimal working set experimentally:
++
++// 	if (ssd1306_set_charge_pump(dev)) {
++// 		return -EIO;
++// 	}
++
++// 	uint8_t cmd_buf[] = {
++// 		SSD1306_SET_ENTIRE_DISPLAY_OFF,
++// #ifdef CONFIG_SSD1306_REVERSE_MODE
++// 		SSD1306_SET_REVERSE_DISPLAY,
++// #else
++// 		SSD1306_SET_NORMAL_DISPLAY,
++// #endif
++// 	};
++
++// 	if (ssd1306_write_bus(dev, cmd_buf, sizeof(cmd_buf), true)) {
++// 		LOG_ERR("ssd1306_write_bus");
++// 		return -EIO;
++// 	}
++
++// 	if (ssd1306_set_contrast(dev, CONFIG_SSD1306_DEFAULT_CONTRAST)) {
++// 		return -EIO;
++// 	}
++
++// 	ssd1306_resume(dev);
++
++// 	return 0;
++}
++
++static int ext_power_status = true;
++
++static int ssd1306_update_ext_power(const struct device *dev, bool ext_power_status_new_value) {
++
++	// minimum sleep needed when waking up
++	if (ext_power_status_new_value == true) {
++		k_sleep(K_MSEC(30));
++	}
++
++	// first update to I2C
++	if (dev->data != NULL) {
++		struct ssd1306_data *driver = dev->data;
++		if (driver->bus != NULL) {
++			if(i2c_update_ext_power(driver->bus, ext_power_status_new_value)) {
++				LOG_ERR("Failed i2c_update_ext_power!");
++				return -EIO;
++			}
++		} else {
++			LOG_ERR("I2C bus is NULL");
++		}
++	} else {
++		LOG_ERR("display data is NULL");
++	}
++	
++	if (ext_power_status != ext_power_status_new_value) {
++		if (ext_power_status_new_value == true)
++		{
++			// sleep after I2C reset
++			k_sleep(K_MSEC(30));
++
++			// re-init oled, sends commands through i2c bus
++			ssd1306_re_init(dev);
++		} else {
++			// no-op for now
++		}
++
++		ext_power_status = ext_power_status_new_value;
++	}
++	return 0;
++}
++
+ static struct ssd1306_data ssd1306_driver;
+ 
+ static struct display_driver_api ssd1306_driver_api = {
++	.update_ext_power = ssd1306_update_ext_power,
+ 	.blanking_on = ssd1306_suspend,
+ 	.blanking_off = ssd1306_resume,
+ 	.write = ssd1306_write,
+@@ -455,7 +533,9 @@ static struct display_driver_api ssd1306_driver_api = {
+ 	.set_orientation = ssd1306_set_orientation,
+ };
+ 
++#define DISPLAY_INIT_PRIORITY 95
++
+ DEVICE_DT_INST_DEFINE(0, ssd1306_init, device_pm_control_nop,
+ 		    &ssd1306_driver, NULL,
+-		    POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY,
++		    POST_KERNEL, DISPLAY_INIT_PRIORITY,
+ 		    &ssd1306_driver_api);
+diff --git a/drivers/i2c/i2c_nrfx_twi.c b/drivers/i2c/i2c_nrfx_twi.c
+index 6fc8c5193..07f83a0a3 100644
+--- a/drivers/i2c/i2c_nrfx_twi.c
++++ b/drivers/i2c/i2c_nrfx_twi.c
+@@ -189,13 +189,13 @@ static int i2c_nrfx_twi_configure(const struct device *dev,
+ 	return 0;
+ }
+ 
+-static const struct i2c_driver_api i2c_nrfx_twi_driver_api = {
+-	.configure = i2c_nrfx_twi_configure,
+-	.transfer  = i2c_nrfx_twi_transfer,
+-};
++
++static int initialized = false;
+ 
+ static int init_twi(const struct device *dev)
+ {
++	LOG_WRN("init_twi");
++
+ 	struct i2c_nrfx_twi_data *dev_data = get_dev_data(dev);
+ 	nrfx_err_t result = nrfx_twi_init(&get_dev_config(dev)->twi,
+ 					  &get_dev_config(dev)->config,
+@@ -209,14 +209,44 @@ static int init_twi(const struct device *dev)
+ 	get_dev_data(dev)->pm_state = DEVICE_PM_ACTIVE_STATE;
+ #endif
+ 
++	initialized = true;
+ 	return 0;
+ }
+ 
++
++static int i2c_nrfx_twi_update_ext_power(const struct device *dev, bool ext_power_enabled) {
++	LOG_WRN("I2C update_ext_power now");
++	if(ext_power_enabled) {
++		LOG_WRN("New state power on, re-init");
++		if (!initialized) {
++			nrfx_twi_uninit(&get_dev_config(dev)->twi);
++			init_twi(dev);
++			// if (get_dev_data(dev)->dev_config) {
++			// 	i2c_nrfx_twi_configure(
++			// 		dev,
++			// 		get_dev_data(dev)->dev_config);
++			// }
++		}
++	} else {
++		if (initialized) {
++			initialized = false;
++		}
++	}
++	return 0;
++}
++
++static const struct i2c_driver_api i2c_nrfx_twi_driver_api = {
++	.update_ext_power = i2c_nrfx_twi_update_ext_power,
++	.configure = i2c_nrfx_twi_configure,
++	.transfer  = i2c_nrfx_twi_transfer,
++};
++
+ #ifdef CONFIG_PM_DEVICE
+ static int twi_nrfx_pm_control(const struct device *dev,
+ 				uint32_t ctrl_command,
+ 				void *context, device_pm_cb cb, void *arg)
+ {
++	LOG_WRN("twi_nrfx_pm_control");
+ 	int ret = 0;
+ 	uint32_t pm_current_state = get_dev_data(dev)->pm_state;
+ 
+@@ -226,19 +256,25 @@ static int twi_nrfx_pm_control(const struct device *dev,
+ 		if (new_state != pm_current_state) {
+ 			switch (new_state) {
+ 			case DEVICE_PM_ACTIVE_STATE:
+-				init_twi(dev);
+-				if (get_dev_data(dev)->dev_config) {
+-					i2c_nrfx_twi_configure(
+-						dev,
+-						get_dev_data(dev)->dev_config);
++				if (!initialized) {
++					init_twi(dev);
++					if (get_dev_data(dev)->dev_config) {
++						i2c_nrfx_twi_configure(
++							dev,
++							get_dev_data(dev)->dev_config);
++					}
+ 				}
+ 				break;
+ 
+ 			case DEVICE_PM_LOW_POWER_STATE:
+ 			case DEVICE_PM_SUSPEND_STATE:
+ 			case DEVICE_PM_OFF_STATE:
++				LOG_WRN("DEVICE_PM_OFF_STATE DEVICE_PM_SUSPEND_STATE DEVICE_PM_LOW_POWER_STATE");
+ 				if (pm_current_state == DEVICE_PM_ACTIVE_STATE) {
+-					nrfx_twi_uninit(&get_dev_config(dev)->twi);
++					if (initialized) {
++						nrfx_twi_uninit(&get_dev_config(dev)->twi);
++						initialized = false;
++					}
+ 				}
+ 				break;
+ 
+diff --git a/include/drivers/display.h b/include/drivers/display.h
+index 3b03bb2bc..e9ce9e845 100644
+--- a/include/drivers/display.h
++++ b/include/drivers/display.h
+@@ -136,6 +136,12 @@ struct display_buffer_descriptor {
+ 	uint16_t pitch;
+ };
+ 
++/**
++ * @typedef display_update_ext_power_api
++ * @brief Callback API to manually update display power state
++ */
++typedef int (*display_update_ext_power_api)(const struct device *dev, bool enabled);
++
+ /**
+  * @typedef display_blanking_on_api
+  * @brief Callback API to turn on display blanking
+@@ -225,6 +231,7 @@ typedef int (*display_set_orientation_api)(const struct device *dev,
+  * API which a display driver should expose
+  */
+ struct display_driver_api {
++	display_update_ext_power_api update_ext_power;
+ 	display_blanking_on_api blanking_on;
+ 	display_blanking_off_api blanking_off;
+ 	display_write_api write;
+@@ -237,6 +244,14 @@ struct display_driver_api {
+ 	display_set_orientation_api set_orientation;
+ };
+ 
++static inline int display_update_ext_power(const struct device *dev, bool enabled)
++{
++	struct display_driver_api *api =
++		(struct display_driver_api *)dev->api;
++
++	return api->update_ext_power(dev, enabled);
++}
++
+ /**
+  * @brief Write data to display
+  *
+diff --git a/include/drivers/i2c.h b/include/drivers/i2c.h
+index 4936a89aa..98467465c 100644
+--- a/include/drivers/i2c.h
++++ b/include/drivers/i2c.h
+@@ -122,6 +122,7 @@ struct i2c_msg {
+  */
+ struct i2c_slave_config;
+ 
++typedef int (*i2c_api_update_ext_power_t)(const struct device *dev, bool enabled);
+ typedef int (*i2c_api_configure_t)(const struct device *dev,
+ 				   uint32_t dev_config);
+ typedef int (*i2c_api_full_io_t)(const struct device *dev,
+@@ -135,6 +136,7 @@ typedef int (*i2c_api_slave_unregister_t)(const struct device *dev,
+ typedef int (*i2c_api_recover_bus_t)(const struct device *dev);
+ 
+ __subsystem struct i2c_driver_api {
++	i2c_api_update_ext_power_t update_ext_power;
+ 	i2c_api_configure_t configure;
+ 	i2c_api_full_io_t transfer;
+ 	i2c_api_slave_register_t slave_register;
+@@ -357,6 +359,18 @@ static inline int z_impl_i2c_transfer(const struct device *dev,
+ 	return api->transfer(dev, msgs, num_msgs, addr);
+ }
+ 
++static inline int i2c_update_ext_power(const struct device *dev, bool enabled)
++{
++	const struct i2c_driver_api *api =
++		(const struct i2c_driver_api *)dev->api;
++
++	if (api->update_ext_power == NULL) {
++		return -ENOTSUP;
++	}
++
++	return api->update_ext_power(dev, enabled);
++}
++
+ /**
+  * @brief Recover the I2C bus
+  *
